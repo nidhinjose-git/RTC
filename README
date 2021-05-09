@@ -1,0 +1,119 @@
+This is a simple rtc driver. From my understanding, RTC drivers are another class
+of drivers similar to say, Network driver, in linux kernel. Userspace depends on
+/dev/rtc* for getting and setting time from/to an RTC hardware device.
+In reality, /dev/rtc* are character device files representing a character
+device driver in kernel space. This character device driver is automatically registered
+by the kernel when you register an rtc driver using rtc_device_register().
+Going deep, rtc_dev_fops is the file_operations structure for rtc character device driver.
+
+UDEV mechanisms detect the registration of an rtc driver and create the
+/dev/rtc* file on the fly.
+
+rtc_device_register()
+====================
+
+struct rtc_device *rtc_device_register(const char *name,
+				       struct device *dev,                              
+				       const struct rtc_class_ops *ops,                              
+				       struct module *owner) 
+
+This function registers an rtc driver and returns a struct rtc_device object.
+Here, for the second argument, passing NULL won't help (insmod goes stuck).
+
+Finding a struct device to pass as second argument to rtc_device_register()
+============================================================================
+Passing NULL as second argument won't help. Insmod goes stuck and system needs hard reset.
+So there was a need to pass a valid struct device. The system had many PCI devices and I decided to use
+struct device of one of those PCI devices for the the time being.
+
+In the example code, I decided to find struct device of Intel Ethernet device whose driver was already up and running.
+Vendor Id and device Id of the Ethernet device was figured out by reading /sys/bus/pci/devices/<bdf>.
+lspci helps with finding the <bdf>.
+
+# lspci -s 00:03.0
+00:03.0 Ethernet controller: Intel Corporation 82540EM Gigabit Ethernet Controller (rev 02)
+
+# cd /sys/bus/pci/devices/0000:00:03.0
+# cat vendor device
+0x8086
+0x100e
+
+pci_get_device() returns struct pci_dev* of the the device, which embeds its struct device. This call also
+increments refcount of the embedded struct device. A future call to pci_dev_put() will decrement the refcount.
+
+Note that it was not necessary that I pass struct device of a PCI device. Any valid struct device
+would have been sufficient for rtc_device_register(). It was easy to get struct pci_dev of a PCI device once
+you have the vendor id and device id, and from there, struct device.
+
+Once the rtc driver was registered, an 'rtc' directory was created inside /sys/bus/pci/devices/0000:00:03.0.
+Well, that was a symlink. The actual path is /sys/devices/pci0000:00/0000:00:03.0
+
+Userspace
+========
+A character device file /dev/rtc-1 was created by udev once rtc driver was registered. /dev/rtc-0 already
+existed which corresponds to another RTC driver previously registered by stock kernel.
+hwclock is a userspace tool to get and set from/to RTC device. By default, hwclock uses /dev/rtc-0 driver
+for get/set operations. Pass -f /dev/rtc1 flag to hwclock to use the new RTC driver.
+
+Note that if you add yet another RTC driver, /dev/rtc2 device file will be created.
+
+read_time() and set_time() callbacks
+====================================
+struct device* parameter received in these callback functions is same as the struct device* passed to
+rtc_device_register(). However, struct rtc contains another struct device. This is the not the one
+passed to read_time() and set_time() callbacks. Hence, we can't use to_rtc_device() macro.
+
+'Linux Device Drivers Development' by John Madieu  book chapter 18, RTC drivers gets this wrong. They say
+
+"All of the hooks in the preceding code are given a struct device structure as a parameter,
+ which is the same as the one embedded in the struct rtc_device structure.This means that from within these hooks,
+ you can access the RTC device itself at any giventime, using the to_rtc_device() macro,
+ which is built on top of the container_of()macro:"
+
+This is wrong. In our example driver, the struct device* that is passed to fake_rtc_read_time() is the one
+inside struct pci_dev.
+
+Errors:
+======
+# hwclock -r -f /dev/rtc1
+hwclock: Timed out waiting for time change.
+hwclock: The Hardware Clock registers contain values that are either invalid (e.g. 50th day of month) or beyond the range we can handle (e.g. Year 2095).
+
+This can happen if read_time() callback returns the same time on multiple reads.
+This is the reason why fake_rtc_read_time() function has a 'counter' variable that increments on each read. Now, read_time() reports a different
+time every time it is called.
+
+Another issue,
+hwclock -r getting stuck on ioctl(RTC_UIE_ON). Following is the the fix
+    rtc->uie_unsupported = 1;dd
+
+Sample Output
+============
+[root@centos-devvm simple_module]# hwclock -r -f /dev/rtc1
+Sun 11 Jul 2021 10:33:48 PM UTC  -0.002884 seconds
+
+[root@centos-devvm simple_module]# dmesg
+[35773.143263] Module inserted
+[35773.143894] Addr of pci_device->dev.kobj = ffff8f3dbc8590a8
+[35773.144675] pci device found, refcount = 6 struct device address = ffff8f3dbc859098
+
+[35773.146510] read_time() callback: struct device* address = ffff8f3dbc859098
+[35773.147296] Reading time rtc
+[35773.147615] e1000 0000:00:03.0: rtc core: registered My_RTC as rtc1
+[35773.148981] RTC driver registered rtc-1, rtc->dev.parent = ffff8f3dbc859098
+[35773.149707] rtc->dev.kobj.parent = "rtc", ffff8f3ce109a7e0
+[35773.150474] rtc->dev.kobj.parent->parent = "0000:00:03.0" ffff8f3ce109a7e0
+[35773.151364] PCI device New ref_count = 8
+
+[35773.152713] read_time() callback: struct device* address = ffff8f3dbc859098
+[35773.153496] Reading time rtc
+[35773.153846] e1000 0000:00:03.0: rtc core: registered My_RTC2 as rtc2
+[35773.155390] Second RTC driver registered rtc-2, rtc2->dev.parent = ffff8f3dbc859098
+[35773.156726] rtc2->dev.kobj.parent = "rtc" ffff8f3ce109a7e0
+[35773.157433] rtc2->dev.kobj.parent->parent = "0000:00:03.0", ffff8f3dbc8590a8
+[35773.158222] PCI device New ref_count = 9
+
+[root@centos-devvm rtc]# pwd
+/sys/devices/pci0000:00/0000:00:03.0/rtc
+[root@centos-devvm rtc]# ls
+rtc1  rtc2
