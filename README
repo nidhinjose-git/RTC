@@ -85,7 +85,7 @@ time every time it is called.
 
 Another issue,
 hwclock -r getting stuck on ioctl(RTC_UIE_ON). Following is the the fix
-    rtc->uie_unsupported = 1;dd
+    rtc->uie_unsupported = 1;
 
 Sample Output
 ============
